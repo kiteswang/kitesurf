@@ -1,0 +1,121 @@
+{
+  "host": "0.0.0.0",
+  "port": 17850,
+
+  "peers": [],
+
+  "rendezvous_url": "wss://waa.kitesurf.chat:17851",
+  "ssl_verify": true,
+  "allow_insecure": false,
+  "auto_accept": false,
+  "admin_port": 17853,
+
+  "public_profile": {
+    "nickname": "",
+    "emoji": "🪁",
+    "tags": [],
+    "group": "kitesurf",
+    "hidden": true
+  },
+
+  "private_profile": {
+    "skills": []
+  },
+
+  "task_timeout": 300,
+
+  "keepalive": {
+    "interval": 30,
+    "min_interval": 20,
+    "max_interval": 55,
+    "miss_tolerance": 3,
+    "adaptive": true
+  },
+
+  "session_to": "",
+  "session_id": "",
+  "agent_name": "main",
+  "gateway_user": "kitesurf",
+  "gateway_token": "",
+
+  "security": {
+    "task_policy": "open",
+
+    "task_approval_mode": "auto",
+
+    "trusted_nodes": [],
+
+    "rate_limit": {
+      "enabled": true,
+      "max_tasks_per_minute": 5,
+      "max_tasks_per_hour": 30,
+      "cooldown_seconds": 10
+    },
+
+    "max_message_length": 10000,
+
+    "blocked_keywords": [
+      "list your skill", "what skill", "what tool", "what capabilit",
+      "your os", "operating system", "what os", "which os",
+      "your ip", "ip address", "your hostname", "open port",
+      "your file", "your directory", "your path", "your workspace",
+      "who are you", "your name", "your identity", "whoami",
+      "your process", "your version", "your uptime",
+      "your database", "your storage", "your redis",
+      "your secret", "your key", "your token", "your password",
+      "your config", "your security", "security setting",
+      "source code", "your repo", "git remote",
+      "reverse shell", "eval(", "exec(", "os.system",
+      "auto_accept", "auto accept", "autoaccept",
+      "ssl_verify", "ssl verify",
+      "allow_insecure", "allow insecure",
+      "rate_limit", "rate limit",
+      "blocked_keyword", "blocked keyword",
+      "trusted_node", "trusted node",
+      "change config", "modify config", "update config",
+      "change security", "modify security", "update security",
+      "disable security", "bypass security", "turn off security",
+      "set hidden false", "hidden false"
+    ],
+
+    "require_approval_keywords": [],
+
+    "log_all_tasks": true
+  },
+
+  "notifications": {
+    "enabled": true,
+    "openclaw_push": true,
+    "webhook_url": "",
+    "webhook_urls": [],
+    "bark_key": "",
+    "serverchan_key": "",
+    "console_banner": true,
+    "on_task": true,
+    "on_invite": true,
+    "on_connect": true,
+    "on_error": true
+  },
+
+  "chain": {
+    "enabled": false,
+    "data_dir": "./chain_data",
+    "wallet_path": "./wallet.json",
+    "wallet_address": "",
+    "wallet_pubkey": "",
+    "scp_version": "scp/1",
+    "chain_capabilities": [],
+    "auto_stake": false,
+    "stake_amount": 100,
+    "block_interval": 5,
+    "max_tx_per_block": 200,
+    "genesis_accounts": {}
+  },
+
+  "gossip": {
+    "enabled": true,
+    "port": 17586,
+    "seed_peers": [],
+    "auto_mesh": true
+  }
+}

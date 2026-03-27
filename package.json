@@ -1,0 +1,38 @@
+{
+  "name": "openclaw-skill-kitesurf",
+  "version": "1.3.0",
+  "description": "KiteSurf — Cross-node AI Agent communication framework. Auto-discovery, pairing, encrypted channels, NAT traversal, WSS self-signed TLS for Leader Mini-RDV, network-resilient auto-fallback.",
+  "keywords": [
+    "openclaw",
+    "skill",
+    "kitesurf",
+    "agent-communication",
+    "peer-to-peer",
+    "multi-agent",
+    "rendezvous",
+    "kitp",
+    "nat-traversal",
+    "encrypted"
+  ],
+  "author": "kIteswang <kiteswang@gmail.com>",
+  "license": "MIT",
+  "files": [
+    "SKILL.md",
+    "package.json",
+    "scripts/kite_agent.py",
+    "scripts/kite_cli.py",
+    "scripts/kite_crypto.py",
+    "scripts/kite_gossip.py",
+    "scripts/kite_node.py",
+    "scripts/kite_notify.py",
+    "scripts/kite_pairing.py",
+    "scripts/kite_punch.py",
+    "scripts/kite_stun.py",
+    "scripts/kite_utils.py",
+    "scripts/kitesurf.config.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kiteswang/kitesurf"
+  }
+}

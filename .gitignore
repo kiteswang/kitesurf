@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+$null
+
+# KiteSurf build artifacts
+kitesurf.zip
+kitesurf.zip.bak
+pack_skill.py
+
+# Docs (internal drafts, not for public repo)
+docs/
+
+# Test files
+scripts/test_*.py
+
+# Runtime files (logs, user configs)
+*.log
+*.pid
+
+# Sensitive runtime data
+wallet.json
+wallet_*.json
+
+# Debug / temp files
+pyinfo.txt
+import_err.txt
+test_output.txt
+zip_info.txt
+zip_verify.txt
+41.0
+scripts/err.txt
+
+# CodeBuddy
+.codebuddy/
