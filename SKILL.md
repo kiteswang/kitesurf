@@ -53,7 +53,7 @@ Natural language → KiteSurf translates to API calls:
 All nodes must share the same `secret`. Minimal configuration:
 
 ```json
-{"secret": "your-shared-secret", "rendezvous_url": "wss://waa.kitesurf.chat:17851"}
+{"secret": "your-shared-secret", "rendezvous_url": "wss://www.kitesurf.chat:17851"}
 ```
 
 Full configuration options:

@@ -4,7 +4,7 @@
 
   "peers": [],
 
-  "rendezvous_url": "wss://waa.kitesurf.chat:17851",
+  "rendezvous_url": "wss://www.kitesurf.chat:17851",
   "ssl_verify": true,
   "allow_insecure": false,
   "auto_accept": false,

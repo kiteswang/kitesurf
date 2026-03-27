@@ -57,7 +57,7 @@ Create `config.json` (**change `secret` to your own key**):
 {
   "secret": "my-team-secret-2026",
   "port": 17850,
-  "rendezvous_url": "wss://waa.kitesurf.chat:17851",
+  "rendezvous_url": "wss://www.kitesurf.chat:17851",
   "auto_accept": false,
   "admin_port": 17853,
   "public_profile": {
