@@ -978,8 +978,10 @@ class KiteNode:
 
         while True:
             try:
+                # 改动一: only consider gossip healthy when UDP is bidirectionally
+                # confirmed (not just RDV-seeded member_count > 0)
                 gossip_has_members = (
-                    self._gossip and self._gossip.member_count() > 0
+                    self._gossip and self._gossip.udp_alive_count() > 0
                 )
 
                 if gossip_has_members and not self._rdv_detached:
@@ -1917,63 +1919,124 @@ class KiteNode:
                        source: str = "auto") -> list:
         """Discover online same-group nodes.
 
+        改动二: RDV is the authoritative member source (who exists).
+        Gossip only supplements with status fields (udp_ok, udp_rtt_ms, state).
+        The two are merged: RDV provides the canonical list, gossip enriches it.
+
         Data source priority (when source='auto'):
-          1. Gossip member table (local, real-time, RDV-independent)
-          2. Rendezvous list_nodes (central, requires RDV online)
+          1. Try RDV first (authoritative, who is registered)
+          2. Merge gossip status fields into RDV results
+          3. If RDV unavailable, fall back to gossip-only
 
         Args:
-            tags: Optional tag filter (OR match — effective for both gossip and RDV).
-            q: Optional full-text search on nickname/node_id (effective for both sources).
+            tags: Optional tag filter (OR match).
+            q: Optional full-text search on nickname/node_id.
             source: 'auto' (default), 'gossip', or 'rdv'.
-                    'auto' = gossip first, fallback to RDV if gossip is empty.
-
-        Returns:
-            List of node info dicts.  Gossip source returns enriched dicts with keys:
-            node_id, addr, addr_hint, public_addr, state, seq, ts, source, plus profile.
-            RDV source returns the full node info from Rendezvous.
         """
-        # ── Gossip source ──
-        if source in ("auto", "gossip") and self._gossip:
-            members = self._gossip.members(include_suspect=True)
-            if members:
-                # Enrich with source tag and normalize field names
-                for m in members:
-                    m["source"] = "gossip"
-                    m["node_id"] = m.pop("id", m.get("node_id", ""))
-                    # Expose addr_hint and public_addr with standard names
-                    if "hint" in m:
-                        m["addr_hint"] = m.pop("hint")
-                    if "pub" in m:
-                        m["public_addr"] = m.pop("pub")
-                # ── Local tags filter (OR match) ──
-                if tags:
-                    members = [m for m in members
-                               if any(t in m.get("tags", []) for t in tags)]
-                # ── Local full-text search (nick / node_id) ──
-                if q:
-                    q_lower = q.lower()
-                    members = [m for m in members
-                               if q_lower in m.get("nick", "").lower()
-                               or q_lower in m.get("node_id", "").lower()]
-                if members or source == "gossip":
-                    return members
-                # All filtered out — fall through to RDV if source is auto
+        # ── Build gossip lookup for merge (all states including dead) ──
+        gossip_map: Dict[str, dict] = {}
+        if self._gossip:
+            # include_dead=True so we can show dead nodes' status too
+            for m in self._gossip.members(include_suspect=True, include_dead=True):
+                nid = m.get("id", m.get("node_id", ""))
+                if nid:
+                    gossip_map[nid] = m
 
-            # Gossip has no members — fall through to RDV if source is auto
-            if source == "gossip":
-                return []
+        # ── Gossip-only mode ──
+        if source == "gossip":
+            result = []
+            for nid, m in gossip_map.items():
+                m["source"] = "gossip"
+                m["node_id"] = m.pop("id", m.get("node_id", ""))
+                if "hint" in m:
+                    m["addr_hint"] = m.pop("hint")
+                if "pub" in m:
+                    m["public_addr"] = m.pop("pub")
+                result.append(m)
+            if tags:
+                result = [m for m in result
+                          if any(t in m.get("tags", []) for t in tags)]
+            if q:
+                q_lower = q.lower()
+                result = [m for m in result
+                          if q_lower in m.get("nick", "").lower()
+                          or q_lower in m.get("node_id", "").lower()]
+            return result
 
-        # ── RDV fallback ──
+        # ── RDV source (authoritative) ──
+        rdv_nodes = []
+        if self._pairing and not self._rdv_detached:
+            try:
+                rdv_nodes = await self._pairing.list_nodes(tags=tags, q=q)
+            except Exception as e:
+                log.debug(f"[{self.node_id}] RDV list_nodes failed: {e}")
+
+        if rdv_nodes:
+            # 改动二: merge gossip status into RDV results
+            for n in rdv_nodes:
+                n["source"] = "rdv+gossip"
+                nid = n.get("node_id", "")
+                gm = gossip_map.pop(nid, None)
+                if gm:
+                    # Supplement with gossip status fields
+                    n["gossip_state"] = gm.get("state", "unknown")
+                    n["udp_ok"] = gm.get("udp_ok")
+                    n["udp_rtt_ms"] = gm.get("udp_rtt_ms")
+                else:
+                    n["gossip_state"] = "unknown"
+                    n["udp_ok"] = None
+                    n["udp_rtt_ms"] = None
+
+            # 改动二: also append gossip-only members not in RDV (dead/suspect)
+            for nid, gm in gossip_map.items():
+                extra = {
+                    "node_id": gm.get("id", nid),
+                    "source": "gossip",
+                    "gossip_state": gm.get("state", "unknown"),
+                    "udp_ok": gm.get("udp_ok"),
+                    "udp_rtt_ms": gm.get("udp_rtt_ms"),
+                }
+                if "nick" in gm:
+                    extra["nickname"] = gm["nick"]
+                if "hint" in gm:
+                    extra["addr_hint"] = gm["hint"]
+                if "pub" in gm:
+                    extra["public_addr"] = gm["pub"]
+                if "tags" in gm:
+                    extra["tags"] = gm["tags"]
+                rdv_nodes.append(extra)
+
+            return rdv_nodes
+
+        # ── RDV unavailable — fall back to gossip ──
+        if gossip_map:
+            result = []
+            for nid, m in gossip_map.items():
+                m["source"] = "gossip"
+                m["node_id"] = m.pop("id", m.get("node_id", ""))
+                if "hint" in m:
+                    m["addr_hint"] = m.pop("hint")
+                if "pub" in m:
+                    m["public_addr"] = m.pop("pub")
+                result.append(m)
+            if tags:
+                result = [m for m in result
+                          if any(t in m.get("tags", []) for t in tags)]
+            if q:
+                q_lower = q.lower()
+                result = [m for m in result
+                          if q_lower in m.get("nick", "").lower()
+                          or q_lower in m.get("node_id", "").lower()]
+            return result
+
+        # ── Neither source available ──
         if not self._pairing:
             if self._gossip:
-                # No RDV configured, return empty gossip result
                 return []
             raise RuntimeError("Neither gossip nor Rendezvous is available for discovery.")
 
-        nodes = await self._pairing.list_nodes(tags=tags, q=q)
-        for n in nodes:
-            n["source"] = "rdv"
-        return nodes
+        # RDV configured but returned empty
+        return []
 
     async def invite_peer(self, target_node_id: str, message: str = "") -> str:
         """Invite a node to pair by discovering its address and directly connecting P2P.

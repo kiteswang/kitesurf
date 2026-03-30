@@ -95,6 +95,10 @@ class MemberEntry:
         "nickname", "emoji", "tags", "hidden", "public_addr",
         # ── TCP address (for KITP direct connect / invite) ──
         "addr_hint",
+        # ── UDP reachability (改动一+四: track UDP bidirectional proof) ──
+        "udp_confirmed",       # True once we receive a direct UDP datagram from this member
+        "udp_rtt_ms",          # latest UDP round-trip time in ms (None = not measured)
+        "udp_last_recv",       # timestamp of last direct UDP datagram received
     )
 
     def __init__(self, node_id: str, addr: str, state: str = MemberState.ALIVE,
@@ -115,6 +119,10 @@ class MemberEntry:
         self.hidden = hidden
         self.public_addr = public_addr      # STUN-discovered public address
         self.addr_hint = addr_hint          # TCP/KITP listen address (from RDV registration)
+        # UDP reachability tracking
+        self.udp_confirmed = False          # set True on first direct UDP datagram
+        self.udp_rtt_ms: Optional[float] = None   # UDP round-trip time (ms)
+        self.udp_last_recv: float = 0.0     # timestamp of last direct UDP recv
 
     def to_dict(self) -> dict:
         d = {
@@ -137,6 +145,10 @@ class MemberEntry:
             d["pub"] = self.public_addr
         if self.addr_hint:
             d["hint"] = self.addr_hint
+        # ── UDP reachability fields (改动四) ──
+        d["udp_ok"] = self.udp_confirmed if self.udp_confirmed else None
+        if self.udp_rtt_ms is not None:
+            d["udp_rtt_ms"] = round(self.udp_rtt_ms, 1)
         return d
 
     @staticmethod
@@ -220,6 +232,9 @@ class KiteGossip:
         # Our advertised address (set during start or externally)
         self._self_addr: str = ""
 
+        # 改动四: per-peer last gossip send timestamp (for UDP RTT estimation)
+        self._peer_last_send_ts: Dict[str, float] = {}
+
         # UDP transport
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._protocol: Optional["_GossipUDPProtocol"] = None
@@ -238,8 +253,13 @@ class KiteGossip:
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def members(self, include_suspect: bool = False) -> List[Dict[str, Any]]:
-        """Return current alive (and optionally suspect) members."""
+    def members(self, include_suspect: bool = False,
+                include_dead: bool = False) -> List[Dict[str, Any]]:
+        """Return current alive (and optionally suspect/dead) members.
+
+        改动五: include_dead=True returns all members including dead,
+        so /peers can show the full picture with state info.
+        """
         result = []
         for nid, entry in self._members.items():
             if nid == self.node_id:
@@ -247,6 +267,8 @@ class KiteGossip:
             if entry.state == MemberState.ALIVE:
                 result.append(entry.to_dict())
             elif include_suspect and entry.state == MemberState.SUSPECT:
+                result.append(entry.to_dict())
+            elif include_dead and entry.state == MemberState.DEAD:
                 result.append(entry.to_dict())
         return result
 
@@ -354,6 +376,18 @@ class KiteGossip:
         """Number of alive members (excluding self)."""
         return sum(1 for nid, e in self._members.items()
                    if nid != self.node_id and e.state == MemberState.ALIVE)
+
+    def udp_alive_count(self) -> int:
+        """Number of members with confirmed UDP bidirectional reachability (改动一).
+
+        Only counts members that are ALIVE **and** have been confirmed via
+        direct UDP datagram exchange.  This is the safe criterion for
+        deciding whether gossip is truly self-sufficient (RDV detach).
+        """
+        return sum(1 for nid, e in self._members.items()
+                   if nid != self.node_id
+                   and e.state == MemberState.ALIVE
+                   and e.udp_confirmed)
 
     def seed_from_rdv(self, nodes: List[Dict[str, Any]]):
         """Seed the member table with nodes discovered from Rendezvous.
@@ -582,8 +616,12 @@ class KiteGossip:
 
                 all_targets = targets + seed_targets
 
+                send_ts = time.time()
                 for addr in all_targets:
                     self._send_dgram(dgram, addr)
+                    # 改动四: record send timestamp per target for RTT estimation
+                    addr_key = f"{addr[0]}:{addr[1]}"
+                    self._peer_last_send_ts[addr_key] = send_ts
 
                 if tick % 6 == 0:  # ~every 60s
                     log.debug(f"[gossip] 📊 Members: {self.member_count()} alive, "
@@ -685,14 +723,13 @@ class KiteGossip:
     def _sweep_members(self):
         """Check each member's liveness and transition states.
 
-        State machine:
+        State machine (改动五: dead 不再剔除，保留在本地表):
           alive  ──(SUSPECT_TIMEOUT)──→  suspect
           suspect ──(DEAD_TIMEOUT)──→    dead
-          dead   ──(EVICT_GRACE)──→      removed from table
+          dead   ──  stays in table (no eviction)
         """
         now = time.time()
         changed = False
-        to_remove = []
 
         for nid, entry in list(self._members.items()):
             if nid == self.node_id:
@@ -709,18 +746,13 @@ class KiteGossip:
             elif entry.state == MemberState.SUSPECT and idle > MEMBER_DEAD_TIMEOUT:
                 entry.state = MemberState.DEAD
                 entry.state_change_at = now
+                entry.udp_confirmed = False  # 改动一: reset UDP confirmation
                 changed = True
                 log.warning(f"[gossip] 🔴 {nid} → DEAD (idle {int(idle)}s)")
                 self._fire_member_leave(nid)
 
-            elif entry.state == MemberState.DEAD:
-                dead_duration = now - entry.state_change_at
-                if dead_duration > MEMBER_EVICT_GRACE:
-                    to_remove.append(nid)
-
-        for nid in to_remove:
-            del self._members[nid]
-            log.info(f"[gossip] 🗑️ {nid} evicted from member table")
+            # 改动五: dead members are NOT evicted — they stay in the local table
+            # so /peers can still show them. RDV seed_from_rdv() can revive them.
 
         if changed:
             self._fire_members_changed()
@@ -909,6 +941,9 @@ class KiteGossip:
                 public_addr=sender_pub,
                 addr_hint=sender_hint,
             )
+            # ── 改动一: direct UDP datagram → confirmed ──
+            self._members[sender_id].udp_confirmed = True
+            self._members[sender_id].udp_last_recv = now
             changed = True
             log.info(f"[gossip] 🆕 Discovered sender: {sender_id} ({sender_addr_str})"
                      f"{f' [{sender_nick}]' if sender_nick else ''}")
@@ -917,6 +952,19 @@ class KiteGossip:
             # Refresh sender's last_seen (direct heartbeat proof)
             entry = self._members[sender_id]
             entry.last_seen = now
+            # ── 改动一+四: mark UDP bidirectional confirmed ──
+            if not entry.udp_confirmed:
+                entry.udp_confirmed = True
+                log.info(f"[gossip] ✅ {sender_id} UDP confirmed (direct datagram received)")
+            entry.udp_last_recv = now
+            # ── 改动四: estimate UDP RTT ──
+            sender_addr_key = f"{sender_addr[0]}:{sender_addr[1]}"
+            last_send = self._peer_last_send_ts.get(sender_addr_key, 0)
+            if last_send > 0:
+                rtt_ms = (now - last_send) * 1000
+                # Only record if reasonable (< 30s, otherwise stale)
+                if rtt_ms < 30000:
+                    entry.udp_rtt_ms = rtt_ms
             if entry.state != MemberState.ALIVE:
                 old = entry.state
                 entry.state = MemberState.ALIVE
