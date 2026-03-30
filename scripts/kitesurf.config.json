@@ -116,6 +116,7 @@
     "enabled": true,
     "port": 17586,
     "seed_peers": [],
-    "auto_mesh": true
+    "auto_mesh": true,
+    "rdv_detach": false
   }
 }

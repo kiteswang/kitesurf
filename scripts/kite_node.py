@@ -455,16 +455,17 @@ class KiteNode:
         self._cluster_members: List[str] = []   # other node_ids in the group
 
         # ── RDV detach state (instance variables — NOT class variables) ──
-        # When gossip is healthy, we disconnect from RDV to become autonomous.
-        # If gossip empties, we reconnect to RDV for re-seeding.
+        # RDV stays connected at all times so new nodes can always discover peers.
+        # Set _rdv_detach_enabled=True (config: gossip.rdv_detach=true) to allow detach (NOT recommended).
+        self._rdv_detach_enabled: bool = False  # master switch — default False: RDV always stays connected
         self._rdv_detached: bool = False    # True when we intentionally disconnected from RDV
         self._RDV_DETACH_GRACE: int = 60   # seconds — wait for gossip to stabilize before detaching
         self._rdv_connect_task: Optional[asyncio.Task] = None  # tracks reconnect tasks to avoid duplicates
         # Discovery loop parameters (instance-level to avoid cross-instance class-var issues)
         self._RDV_BOOTSTRAP_INTERVAL: int = 30    # seconds — aggressive RDV polling before first seed
-        self._RDV_STEADY_INTERVAL: int = 300      # seconds — lazy RDV reseed after gossip is healthy
+        self._RDV_STEADY_INTERVAL: int = 120       # seconds — RDV reseed after gossip is healthy (was 300)
         self._RDV_SEEDED: bool = False             # has gossip ever been successfully seeded?
-        self._RDV_STEADY_KEEPALIVE: int = 120      # seconds — RDV ping interval when gossip is healthy
+        self._RDV_STEADY_KEEPALIVE: int = 55       # seconds — RDV ping interval when gossip is healthy (well within 120s stale timeout)
 
         # ── Connection strategy timeouts (instance variables) ──
         self._INBOUND_WAIT_TIMEOUT: float = 45.0   # passive side wait for peer inbound connect
@@ -631,7 +632,8 @@ class KiteNode:
 
     def enable_gossip(self, seed_peers: Optional[List[str]] = None,
                       gossip_port: int = 17586,
-                      auto_mesh: bool = True):
+                      auto_mesh: bool = True,
+                      rdv_detach: bool = False):
         """Enable UDP gossip protocol for group membership management.
 
         The gossip protocol provides decentralized node discovery, liveness
@@ -646,6 +648,9 @@ class KiteNode:
             gossip_port: UDP port for gossip protocol (default 17586).
             auto_mesh: If True, enable RDV discovery loop that seeds the gossip
                        protocol with newly discovered peers. Default True.
+            rdv_detach: If True, disconnect from RDV once gossip is stable
+                        (Step ⑤). Default False — RDV stays always connected
+                        so new nodes can always discover existing peers.
         """
         if not self._group or self._group == "*":
             log.warning(f"[{self.node_id}] gossip requires a named group (not empty/'*') — skipped")
@@ -659,6 +664,7 @@ class KiteNode:
         self._gossip_enabled = True
         self._gossip_port = gossip_port
         self._auto_mesh_enabled = auto_mesh
+        self._rdv_detach_enabled = rdv_detach
         self._gossip_seed_peers = seed_peers or []
         log.info(f"[{self.node_id}] 📡 Gossip enabled: group='{self._group}', "
                  f"port={gossip_port}, seed_peers={self._gossip_seed_peers}, "
@@ -957,7 +963,12 @@ class KiteNode:
             # Once gossip is healthy (has members), we no longer need RDV.
             # Disconnect to reduce central dependency.  If gossip becomes
             # empty later, reconnect to RDV for re-seeding.
-            self._track_task(self._rdv_detach_monitor(), name="rdv_detach_monitor")
+            # Disabled when config gossip.rdv_detach = false.
+            if self._rdv_detach_enabled:
+                self._track_task(self._rdv_detach_monitor(), name="rdv_detach_monitor")
+            else:
+                log.info(f"[{self.node_id}] 📡 Step ⑤ skipped — rdv_detach disabled, "
+                         f"RDV stays connected alongside gossip")
 
         await self._pairing.connect()
 
@@ -1537,13 +1548,26 @@ class KiteNode:
                      f"{actual_peer} ({total_ms:.0f}ms)")
             try:
                 await self._handle_messages(ews, actual_peer)
+            except WsConnectionClosed as wsc:
+                # Capture the WebSocket close reason for diagnostics
+                close_code = getattr(wsc, 'code', None) or getattr(wsc, 'rcvd', None)
+                close_reason = getattr(wsc, 'reason', '') or str(wsc)
+                log.info(f"[{self.node_id}] 🔌 {actual_peer} WebSocket closed "
+                         f"(code={close_code}, reason={close_reason!r})")
             finally:
                 # Message loop exited — clean up.
                 # Only remove if WE are still the active connection handler.
                 if self.connections.get(actual_peer) is ews:
+                    # Extract close reason from the underlying ws for diagnostics
+                    _close_reason = ""
+                    _raw_ws = getattr(ews, '_ws', ews)
+                    if hasattr(_raw_ws, 'close_code'):
+                        _cc = _raw_ws.close_code
+                        _cr = getattr(_raw_ws, 'close_reason', '') or ''
+                        _close_reason = f" (ws_close={_cc}" + (f", reason={_cr!r}" if _cr else "") + ")"
                     del self.connections[actual_peer]
                     self._connecting_peers.discard(actual_peer)
-                    log.info(f"[{self.node_id}] 🔴 {actual_peer} disconnected "
+                    log.info(f"[{self.node_id}] 🔴 {actual_peer} disconnected{_close_reason} "
                              f"[{len(self.connections)} active]")
                     if _kn:
                         _kn.get().notify_connect(actual_peer, connected=False,
@@ -2056,19 +2080,49 @@ class KiteNode:
             RuntimeError: if Rendezvous is not configured.
             LookupError: if the target node is not found on Rendezvous.
         """
-        if not self._pairing:
-            raise RuntimeError("Rendezvous not configured. Set rendezvous_url in KiteNode.")
+        if not self._pairing and not self._gossip:
+            raise RuntimeError(
+                "Neither Rendezvous nor Gossip is configured. "
+                "Cannot discover peer addresses. Set rendezvous_url or enable gossip."
+            )
 
         # ── 1. Discover target node to obtain its addresses ──
-        nodes = await self._pairing.list_nodes()
+        # Priority: RDV (authoritative) → Gossip (decentralized fallback)
         target_info = None
-        for n in nodes:
-            if n.get("node_id") == target_node_id:
-                target_info = n
-                break
+
+        # 1a. Try Rendezvous first (if connected and not detached)
+        if self._pairing and not self._rdv_detached:
+            try:
+                nodes = await self._pairing.list_nodes()
+                for n in nodes:
+                    if n.get("node_id") == target_node_id:
+                        target_info = n
+                        break
+            except Exception as e:
+                log.warning(f"[{self.node_id}] RDV list_nodes failed: {e}, trying gossip fallback")
+
+        # 1b. Gossip fallback — peer may be visible via gossip but not registered on RDV
+        #     Include dead/suspect members: a "dead" gossip state only means UDP
+        #     heartbeats stopped — the node's TCP/KITP port may still be reachable.
+        #     Using cached addr_hint allows direct TCP dial even when UDP is blocked.
+        if not target_info and self._gossip:
+            gossip_members = self._gossip.members(include_suspect=True, include_dead=True)
+            for m in gossip_members:
+                if m.get("id") == target_node_id or m.get("node_id") == target_node_id:
+                    target_info = {
+                        "node_id": m.get("id") or m.get("node_id", ""),
+                        "addr_hint": m.get("hint") or m.get("addr_hint", ""),
+                        "public_addr": m.get("pub") or m.get("public_addr", ""),
+                    }
+                    log.info(f"[{self.node_id}] 📡 Found {target_node_id} via gossip fallback "
+                             f"(addr_hint={_mask_ip(target_info.get('addr_hint', ''))}, "
+                             f"public_addr={_mask_ip(target_info.get('public_addr', ''))})")
+                    break
+
         if not target_info:
+            source = "Rendezvous or Gossip" if self._gossip else "Rendezvous"
             raise LookupError(
-                f"Node {target_node_id!r} not found on Rendezvous. "
+                f"Node {target_node_id!r} not found on {source}. "
                 f"Is it online and in the same group?"
             )
 
@@ -2183,13 +2237,29 @@ class KiteNode:
         for i in range(checks):
             await asyncio.sleep(interval)
             if peer_id not in self.connections:
+                # Build diagnostic hints about WHY the connection dropped
+                hints = []
+                if not self._auto_accept:
+                    _trusted = getattr(self, '_trusted_connect_nodes', set())
+                    if peer_id not in _trusted:
+                        hints.append(
+                            f"auto_accept=false and {peer_id} is NOT in trusted_nodes — "
+                            f"the remote peer may also have auto_accept=false and didn't approve our connection"
+                        )
+                # Check if peer was ever in connections (flash disconnect vs never connected)
+                if peer_id in self._peer_verify_keys:
+                    hints.append("KITP handshake completed (keys exchanged) but connection died immediately after")
+                else:
+                    hints.append("KITP handshake may not have completed (no peer verify key stored)")
+
+                hint_str = "; ".join(hints) if hints else "unknown cause"
+                elapsed = interval * (i + 1)
                 log.warning(f"[{self.node_id}] ⚠️ Connection to {peer_id} died during "
-                            f"stability check (check {i + 1}/{checks}, {interval * (i + 1):.1f}s "
-                            f"after handshake)")
+                            f"stability check (check {i + 1}/{checks}, {elapsed:.1f}s "
+                            f"after handshake). Diagnosis: {hint_str}")
                 raise ConnectionError(
                     f"Connection to {peer_id} was established but dropped within "
-                    f"{interval * (i + 1):.1f}s. The peer may have disconnected, "
-                    f"or the relay channel was interrupted."
+                    f"{elapsed:.1f}s — flash disconnect. Diagnosis: {hint_str}"
                 )
         log.info(f"[{self.node_id}] ✅ Connection to {peer_id} stable "
                  f"(survived {grace}s grace period)")
@@ -2599,7 +2669,9 @@ class KiteNode:
                     log.warning(f"[{self.node_id}] ⚠️ Failed to parse/verify peer Ed25519 key: {e}")
                     return False
             else:
-                log.warning(f"[{self.node_id}] ⚠️ WELCOME missing ed25519_pub from {actual_peer_id}")
+                log.warning(f"[{self.node_id}] ❌ WELCOME missing ed25519_pub from {actual_peer_id} "
+                            f"— rejecting unauthenticated connection")
+                return False
 
             # ── ECDH: derive shared secret from peer's public key ──
             peer_ecdh_pub_hex = resp.payload.get("ecdh_pub", "")

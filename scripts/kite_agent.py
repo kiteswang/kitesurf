@@ -594,13 +594,16 @@ class KiteSurfAgent:
             seed_peers = gossip_cfg.get("seed_peers", [])
             gossip_port = gossip_cfg.get("port", 17586)
             auto_mesh = gossip_cfg.get("auto_mesh", True)
+            rdv_detach = gossip_cfg.get("rdv_detach", False)
             self.node.enable_gossip(
                 seed_peers=seed_peers,
                 gossip_port=gossip_port,
                 auto_mesh=auto_mesh,
+                rdv_detach=rdv_detach,
             )
             log.info(f"[kite-agent] 📡 Gossip protocol enabled "
-                     f"(port={gossip_port}, seeds={seed_peers}, auto_mesh={auto_mesh})")
+                     f"(port={gossip_port}, seeds={seed_peers}, auto_mesh={auto_mesh}, "
+                     f"rdv_detach={rdv_detach})")
 
         self.node.on_task(self._handle_task)
 
@@ -2257,10 +2260,14 @@ class KiteSurfAgent:
             job["status"] = "cancelled"
             job["error"] = "Job cancelled"
             log.info(f"[kite-agent] 🚫 Job {job_id}: cancelled")
-        except ConnectionError as e:
-            job["status"] = "failed"
+        except LookupError as e:
+            job["status"] = "not_found"
             job["error"] = str(e)
-            log.warning(f"[kite-agent] ❌ Job {job_id}: connection unstable → {target}: {e}")
+            log.warning(f"[kite-agent] ❌ Job {job_id}: peer not found → {target}: {e}")
+        except ConnectionError as e:
+            job["status"] = "flash_disconnect"
+            job["error"] = str(e)
+            log.warning(f"[kite-agent] ❌ Job {job_id}: flash disconnect → {target}: {e}")
         except Exception as e:
             job["status"] = "failed"
             job["error"] = str(e)
@@ -2408,6 +2415,38 @@ class KiteSurfAgent:
                     "ok": False,
                     "error": "timeout",
                     "detail": str(e),
+                    "elapsed_seconds": round(elapsed, 1),
+                }
+            except LookupError as e:
+                elapsed = time.time() - t0
+                log.warning(f"[kite-agent] ❌ /reconnect → peer not found after {elapsed:.1f}s: {e}")
+                return {
+                    "ok": False,
+                    "error": "peer_not_found",
+                    "detail": str(e),
+                    "hint": "The peer may be offline, or not in the same group. "
+                            "Check /gossip and /peers for visible nodes.",
+                    "elapsed_seconds": round(elapsed, 1),
+                }
+            except ConnectionError as e:
+                elapsed = time.time() - t0
+                detail = str(e)
+                log.error(f"[kite-agent] ❌ /reconnect → connection dropped after {elapsed:.1f}s: {detail}")
+                # Provide actionable hints based on the diagnosis
+                hints = []
+                if "auto_accept=false" in detail:
+                    hints.append("Either you or the peer has auto_accept=false. "
+                                 "Add the peer to trusted_nodes in config, or approve the "
+                                 "connection via POST /approve on the remote node.")
+                if "flash disconnect" in detail:
+                    hints.append("The TCP connection succeeded but was immediately closed. "
+                                 "Possible causes: peer's auto_accept gate, group mismatch, "
+                                 "tie-break race, or Ed25519 clock drift (>300s).")
+                return {
+                    "ok": False,
+                    "error": "flash_disconnect",
+                    "detail": detail,
+                    "hints": hints if hints else ["Check remote node logs for the close reason."],
                     "elapsed_seconds": round(elapsed, 1),
                 }
             except Exception as e:
